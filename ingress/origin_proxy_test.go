@@ -80,16 +80,25 @@ func TestProxyAwareDialer(t *testing.T) {
 			origHTTP := os.Getenv("HTTP_PROXY")
 			origHTTPS := os.Getenv("HTTPS_PROXY")
 			origSOCKS := os.Getenv("ALL_PROXY")
+			origHttpLower := os.Getenv("http_proxy")
+			origHttpsLower := os.Getenv("https_proxy")
+			origAllLower := os.Getenv("all_proxy")
 
 			defer func() {
 				os.Setenv("HTTP_PROXY", origHTTP)
 				os.Setenv("HTTPS_PROXY", origHTTPS)
 				os.Setenv("ALL_PROXY", origSOCKS)
+				os.Setenv("http_proxy", origHttpLower)
+				os.Setenv("https_proxy", origHttpsLower)
+				os.Setenv("all_proxy", origAllLower)
 			}()
 
 			os.Setenv("HTTP_PROXY", tt.httpProxy)
 			os.Setenv("HTTPS_PROXY", tt.httpsProxy)
 			os.Setenv("ALL_PROXY", tt.socksProxy)
+			os.Setenv("http_proxy", tt.httpProxy)
+			os.Setenv("https_proxy", tt.httpsProxy)
+			os.Setenv("all_proxy", tt.socksProxy)
 
 			dialer := newProxyAwareDialer(30*time.Second, 30*time.Second, TestLogger)
 			assert.NotNil(t, dialer)
