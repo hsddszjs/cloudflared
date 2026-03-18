@@ -10,6 +10,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 
+	"github.com/cloudflare/cloudflared/doh"
 	"github.com/cloudflare/cloudflared/management"
 )
 
@@ -83,19 +84,6 @@ type EdgeAddr struct {
 	IPVersion EdgeIPVersion
 }
 
-// If the call to net.LookupSRV fails, try to fall back to DoT from Cloudflare directly.
-//
-// Note: Instead of DoT, we could also have used DoH. Either of these:
-//   - directly via the JSON API (https://1.1.1.1/dns-query?ct=application/dns-json&name=_origintunneld._tcp.argotunnel.com&type=srv)
-//   - indirectly via `tunneldns.NewUpstreamHTTPS()`
-//
-// But both of these cases miss out on a key feature from the stdlib:
-//
-//	"The returned records are sorted by priority and randomized by weight within a priority."
-//	(https://golang.org/pkg/net/#Resolver.LookupSRV)
-//
-// Does this matter? I don't know. It may someday. Let's use DoT so we don't need to worry about it.
-// See also: Go feature request for stdlib-supported DoH: https://github.com/golang/go/issues/27552
 var fallbackLookupSRV = lookupSRVWithDOT
 
 var friendlyDNSErrorLines = []string{
@@ -116,19 +104,31 @@ func edgeDiscovery(log *zerolog.Logger, srvService string) ([][]*EdgeAddr, error
 		Str("domain", "_"+srvService+"._"+srvProto+"."+srvName).
 		Msg("edge discovery: looking up edge SRV record")
 
-	_, addrs, err := netLookupSRV(srvService, srvProto, srvName)
-	if err != nil {
-		_, fallbackAddrs, fallbackErr := fallbackLookupSRV(srvService, srvProto, srvName)
-		if fallbackErr != nil || len(fallbackAddrs) == 0 {
-			// use the original DNS error `err` in messages, not `fallbackErr`
-			logger.Err(err).Msg("edge discovery: error looking up Cloudflare edge IPs: the DNS query failed")
-			for _, s := range friendlyDNSErrorLines {
-				logger.Error().Msg(s)
-			}
-			return nil, errors.Wrapf(err, "Could not lookup srv records on _%v._%v.%v", srvService, srvProto, srvName)
+	var addrs []*net.SRV
+	var err error
+
+	// When HTTP proxy is configured, use DoH exclusively.
+	// Local DNS and DoT are unreliable in proxy-required environments (e.g. China).
+	if doh.HasProxy() {
+		logger.Info().Msg("edge discovery: HTTPS_PROXY set, using DoH via proxy")
+		_, addrs, err = doh.LookupSRV(srvService, srvProto, srvName)
+		if err != nil {
+			logger.Err(err).Msg("edge discovery: DoH SRV lookup failed")
+			return nil, errors.Wrapf(err, "Could not lookup srv records via DoH on _%v._%v.%v", srvService, srvProto, srvName)
 		}
-		// Accept the fallback results and keep going
-		addrs = fallbackAddrs
+	} else {
+		_, addrs, err = netLookupSRV(srvService, srvProto, srvName)
+		if err != nil {
+			_, fallbackAddrs, fallbackErr := fallbackLookupSRV(srvService, srvProto, srvName)
+			if fallbackErr != nil || len(fallbackAddrs) == 0 {
+				logger.Err(err).Msg("edge discovery: error looking up Cloudflare edge IPs: the DNS query failed")
+				for _, s := range friendlyDNSErrorLines {
+					logger.Error().Msg(s)
+				}
+				return nil, errors.Wrapf(err, "Could not lookup srv records on _%v._%v.%v", srvService, srvProto, srvName)
+			}
+			addrs = fallbackAddrs
+		}
 	}
 
 	var resolvedAddrPerCNAME [][]*EdgeAddr
@@ -151,7 +151,6 @@ func edgeDiscovery(log *zerolog.Logger, srvService string) ([][]*EdgeAddr, error
 }
 
 func lookupSRVWithDOT(srvService string, srvProto string, srvName string) (cname string, addrs []*net.SRV, err error) {
-	// Inspiration: https://github.com/artyom/dot/blob/master/dot.go
 	r := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, _ string, _ string) (net.Conn, error) {
@@ -170,13 +169,26 @@ func lookupSRVWithDOT(srvService string, srvProto string, srvName string) (cname
 }
 
 func resolveSRV(srv *net.SRV) ([]*EdgeAddr, error) {
-	ips, err := netLookupIP(srv.Target)
+	var ips []net.IP
+	var err error
+
+	// When proxy is set, use DoH for IP resolution too
+	if doh.HasProxy() {
+		ips, err = doh.LookupIP(srv.Target)
+	} else {
+		ips, err = netLookupIP(srv.Target)
+	}
+
 	if err != nil {
 		return nil, errors.Wrapf(err, "Couldn't resolve SRV record %v", srv)
 	}
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("SRV record %v had no IPs", srv)
 	}
+	return ipsToEdgeAddrs(ips, srv.Port), nil
+}
+
+func ipsToEdgeAddrs(ips []net.IP, port uint16) []*EdgeAddr {
 	addrs := make([]*EdgeAddr, len(ips))
 	for i, ip := range ips {
 		version := V6
@@ -184,12 +196,12 @@ func resolveSRV(srv *net.SRV) ([]*EdgeAddr, error) {
 			version = V4
 		}
 		addrs[i] = &EdgeAddr{
-			TCP:       &net.TCPAddr{IP: ip, Port: int(srv.Port)},
-			UDP:       &net.UDPAddr{IP: ip, Port: int(srv.Port)},
+			TCP:       &net.TCPAddr{IP: ip, Port: int(port)},
+			UDP:       &net.UDPAddr{IP: ip, Port: int(port)},
 			IPVersion: version,
 		}
 	}
-	return addrs, nil
+	return addrs
 }
 
 // ResolveAddrs resolves TCP address given a list of addresses. Address can be a hostname, however, it will return at most one

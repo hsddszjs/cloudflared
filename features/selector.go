@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/cloudflare/cloudflared/doh"
 )
 
 const (
@@ -177,6 +179,15 @@ func newDNSResolver() *dnsResolver {
 }
 
 func (dr *dnsResolver) lookupRecord(ctx context.Context) ([]byte, error) {
+	// When proxy is configured, use DoH for TXT lookup
+	if doh.HasProxy() {
+		records, err := doh.LookupTXT(featureSelectorHostname)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(records[0]), nil
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, lookupTimeout)
 	defer cancel()
 

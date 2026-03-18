@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	"github.com/cloudflare/cloudflared/doh"
 )
 
 const (
@@ -38,7 +40,16 @@ func (p ProtocolPercents) GetPercentage(protocol string) int32 {
 
 // ProtocolPercentage returns the ratio of protocols and a specification ratio for their selection.
 func ProtocolPercentage() (ProtocolPercents, error) {
-	records, err := net.LookupTXT(protocolRecord)
+	var records []string
+	var err error
+
+	// When proxy is configured, use DoH for TXT lookup
+	if doh.HasProxy() {
+		records, err = doh.LookupTXT(protocolRecord)
+	} else {
+		records, err = net.LookupTXT(protocolRecord)
+	}
+
 	if err != nil {
 		return nil, err
 	}
